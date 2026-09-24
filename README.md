@@ -32,13 +32,13 @@ heuristic by nature.
 Put it early in `<head>`. Don't use `async` or `defer`, because the pre-paint gate needs to run before first paint.
 
 ```html
-<script src="https://cdn.jsdelivr.net/gh/ra-kesh/anticlone@main/anticlone.js"
+<script src="https://cdn.jsdelivr.net/gh/ra-kesh/anticlone@v0.1.0/anticlone.js"
         data-origins="example.com,*.example.com"
         data-watermark="build-2026-09-24"
         data-report="https://example.com/api/clone-report"></script>
 ```
 
-For production, self-host it or pin a commit hash instead of `@main`.
+The URL is pinned to a released version. Use `@main` for the latest, or self-host the file. See [SECURITY.md](SECURITY.md) to report issues.
 
 It works anywhere you can paste custom code into the header, including Webflow,
 WordPress, Shopify, Framer, Wix, Squarespace and plain HTML.
