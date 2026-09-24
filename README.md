@@ -155,4 +155,4 @@ The script is one layer. For real assurance, add these server-side layers:
 
 ## License
 
-MIT. Use it, fork it, ship it. No warranty.
+MIT, see [LICENSE](LICENSE). Use it, fork it, ship it. No warranty.
