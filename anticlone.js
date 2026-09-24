@@ -1,5 +1,5 @@
 /*!
- * anticlone.js v0.1.0 — open-source website clone deterrence.
+ * anticlone.js v0.2.0 — open-source website clone deterrence.
  * MIT License. https://github.com/ra-kesh/anticlone
  *
  * A copied website only hurts you when two things happen:
@@ -9,17 +9,16 @@
  *
  * This script works on both:
  *   - Capture: detect known capture-tool fingerprints and automation, then
- *     hide the page and feed serializers blank data ("shield").
+ *     hide the page and intercept common page-world read APIs ("shield").
  *   - Redeploy: if the page ever runs on a hostname you didn't allow (or from
  *     a saved file), report it — and optionally shield or redirect.
- *   - Attribution: every report carries your watermark id, so you can prove
- *     where a copy came from.
+ *   - Leads: reports carry your watermark id to help you find copies.
  *
  * It is a deterrent, not DRM. Anything a browser can display can be copied by
  * a determined person. See README "Limits".
  *
  * Usage (place early in <head>, without async/defer for the pre-paint gate):
- *   <script src="anticlone.min.js"
+ *   <script src="anticlone.js"
  *     data-origins="example.com,*.example.com"  allowed hostnames (enables foreign-origin check)
  *     data-foreign="report"                      report | shield | redirect
  *     data-canonical="https://example.com"       redirect target for data-foreign="redirect"
@@ -27,7 +26,9 @@
  *     data-watermark="build-2026-09-24-a1"       your attribution id (optional)
  *     data-message="This page is protected."     shield text (optional)
  *     data-fingerprints="id-one,id-two"          extra capture-tool element ids (optional)
- *     data-safe-mode                             only hard (certain) detectors act
+ *     data-safe-mode                             only hard detectors act; no pre-paint gate
+ *     data-no-gate                               disable the pre-paint gate
+ *     data-gate-ms="800"                         max time the pre-paint gate may hide the page
  *     data-allow-automation                      ignore webdriver/headless (your own E2E tests)
  *     data-nonce="..."                           CSP nonce for the injected <style>
  *     data-debug                                 console logging
@@ -35,16 +36,17 @@
  *
  * Or set window.AntiCloneConfig = { origins: [...], report: "...", ... } before the script.
  *
- * Events on document: "anticlone:shield" {detector, sticky},
- *                     "anticlone:heal" {via},
- *                     "anticlone:detect" {detector, action}
- * API: window.anticlone = { version, state, shield(detector, sticky), heal(via) }
+ * Events on document: "anticlone:detect"  {detector, action}  action: shield|suspect|report|redirect
+ *                     "anticlone:shield"  {detector, sticky}
+ *                     "anticlone:heal"    {via}
+ * API: window.anticlone = { version, state (read-only snapshot), shield(detector),
+ *                           heal(), expectScroll(ms) }
  */
 (function () {
   "use strict";
   if (window.anticlone && window.anticlone.version) return;
 
-  var VERSION = "0.1.0";
+  var VERSION = "0.2.0";
   var script = document.currentScript;
   var G = window.AntiCloneConfig || {};
   var attr = function (n) { return script ? script.getAttribute(n) : null; };
@@ -54,6 +56,7 @@
     if (Object.prototype.toString.call(v) === "[object Array]") return v;
     return String(v).split(",").map(function (s) { return s.trim(); }).filter(Boolean);
   };
+  var num = function (v, d) { var n = parseInt(v, 10); return isFinite(n) && n >= 0 ? n : d; };
 
   var CFG = {
     origins: list(attr("data-origins") || G.origins),
@@ -64,21 +67,24 @@
     message: attr("data-message") || G.message || "This page is protected",
     fingerprints: list(attr("data-fingerprints") || G.fingerprints),
     safeMode: flag("data-safe-mode", "safeMode"),
+    noGate: flag("data-no-gate", "noGate"),
+    gateMs: num(attr("data-gate-ms") || G.gateMs, 800),
     allowAutomation: flag("data-allow-automation", "allowAutomation"),
     nonce: attr("data-nonce") || G.nonce || null,
     debug: flag("data-debug", "debug"),
-    // Tuning. Soft detectors only act when the page has been idle, and heal
-    // on the next real input — false positives cost a user one click.
+    // Tuning. Soft signals are only suspicions; the page is shielded when two
+    // distinct ones agree, and heals on the next real input.
     armDelayMs: 2500,
     quietMs: 15000,
     scrollQuietMs: 2000,
-    scrollVelocity: 60,   // px/ms
-    scrollMinJump: 400,   // px
+    scrollVelocity: 60,     // px/ms
+    scrollMinJump: 400,     // px
     stallMs: 700,
     stallCount: 3,
     longTaskMs: 500,
     longTaskCount: 3,
     longTaskWindowMs: 45000,
+    corroborateMs: 60000,   // window in which two distinct soft signals must agree
     watchWindowMs: 120000
   };
 
@@ -93,12 +99,20 @@
   var isGoodBot = GOOD_BOTS.test(navigator.userAgent || "");
 
   var root = document.documentElement;
+  // Private enforcement state. The public API only exposes copies of it.
   var state = { shielded: false, sticky: false, detector: null, detections: [] };
   var reported = {};
 
   // ------------------------------------------------------------- events
   function emit(name, detail) {
     try { document.dispatchEvent(new CustomEvent("anticlone:" + name, { detail: detail })); } catch (e) {}
+  }
+
+  // Referrer is reduced to its origin: full referrer URLs can carry tokens or
+  // personal data in their path/query. The current page is sent as pathname
+  // only (no query or fragment).
+  function referrerOrigin() {
+    try { return document.referrer ? new URL(document.referrer).origin : ""; } catch (e) { return ""; }
   }
 
   function report(detector, extra) {
@@ -112,7 +126,7 @@
       host: location.hostname,
       protocol: location.protocol,
       path: (location.pathname || "").slice(0, 512),
-      referrer: (document.referrer || "").slice(0, 512),
+      referrerOrigin: referrerOrigin(),
       watermark: CFG.watermark,
       ua: navigator.userAgent,
       t: Date.now()
@@ -133,7 +147,7 @@
     "html.ac-shield body img,html.ac-shield body svg,html.ac-shield body video,html.ac-shield body canvas,html.ac-shield body iframe,html.ac-shield body picture{opacity:0!important;visibility:hidden!important}",
     "html.ac-shield body *::before,html.ac-shield body *::after{content:none!important}",
     "html.ac-shield body>*{content-visibility:hidden!important;contain-intrinsic-size:auto 1px!important}",
-    "#ac-msg{position:fixed;inset:0;z-index:2147483647;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;pointer-events:none;font:13px/1.4 system-ui,-apple-system,sans-serif;color:rgba(255,255,255,.85);text-align:center}",
+    "#ac-msg{position:fixed!important;inset:0!important;z-index:2147483647!important;display:flex!important;visibility:visible!important;opacity:1!important;flex-direction:column;align-items:center;justify-content:center;gap:8px;pointer-events:none;font:13px/1.4 system-ui,-apple-system,sans-serif;color:rgba(255,255,255,.85);text-align:center}",
     "#ac-msg p{margin:0}#ac-msg .ac-sub{font-size:12px;color:rgba(255,255,255,.5)}",
     "img{-webkit-user-drag:none}"
   ].join("");
@@ -144,21 +158,36 @@
   if (CFG.nonce) styleEl.setAttribute("nonce", CFG.nonce);
   styleEl.textContent = CSS;
   (document.head || root).appendChild(styleEl);
-  var ensureStyle = function () { if (!styleEl.isConnected) (document.head || root).appendChild(styleEl); };
+
+  // Put the stylesheet back exactly as shipped (re-attached, text restored,
+  // not disabled, no media query narrowing it).
+  function ensureStyle() {
+    try {
+      if (!styleEl.isConnected) (document.head || root).appendChild(styleEl);
+      if (styleEl.textContent !== CSS) styleEl.textContent = CSS;
+      if (styleEl.hasAttribute("media")) styleEl.removeAttribute("media");
+      if (styleEl.disabled) styleEl.disabled = false;
+      if (styleEl.sheet && styleEl.sheet.disabled) styleEl.sheet.disabled = false;
+    } catch (e) {}
+  }
 
   // Watermark: survives in any HTML copy (attribute + CSS var + comment).
   if (CFG.watermark) {
     try { root.setAttribute("data-ac-wm", CFG.watermark); } catch (e) {}
-    document.addEventListener("DOMContentLoaded", function () {
+    var stampComment = function () {
       try { document.body.appendChild(document.createComment(" ac:" + CFG.watermark + " ")); } catch (e) {}
-    }, { once: true });
+    };
+    if (document.body) stampComment();
+    else document.addEventListener("DOMContentLoaded", stampComment, { once: true });
   }
 
-  // ------------------------------------------------------ API poisoning
-  // While shielded, the read APIs a DOM serializer relies on return empty data.
+  // ------------------------------------------------------ API interception
+  // While shielded, common page-world read APIs used by DOM serializers return
+  // empty data. This does NOT cover code that obtains native methods elsewhere
+  // (a fresh iframe, an extension's isolated world) — see README "Limits".
   var originals = null;
   var overlay = null;
-  function poisonReads() {
+  function interceptReads() {
     if (originals) return;
     originals = {};
     try {
@@ -238,11 +267,23 @@
     return d;
   }
 
-  var guard = null;
+  // Re-assert every part of the shield. Runs on observed mutations and on a
+  // timer (property changes such as sheet.disabled fire no mutation).
+  function reassert() {
+    if (!state.shielded) return;
+    if (!root.classList.contains("ac-shield")) root.classList.add("ac-shield");
+    ensureStyle();
+    if (overlay) {
+      if (!overlay.isConnected) root.appendChild(overlay);
+      if (overlay.hasAttribute("style")) overlay.removeAttribute("style");
+      if (overlay.hasAttribute("hidden")) overlay.removeAttribute("hidden");
+      if (overlay.id !== "ac-msg") overlay.id = "ac-msg";
+    }
+  }
+
+  var guard = null, guardTimer = 0;
   function shield(detector, sticky) {
     if (sticky) state.sticky = true;
-    report(detector);
-    emit("detect", { detector: detector, action: "shield" });
     if (state.shielded) return;
     state.shielded = true;
     state.detector = detector;
@@ -252,15 +293,14 @@
     overlay = overlay || buildOverlay();
     root.appendChild(overlay);
     try {
-      guard = new MutationObserver(function () {
-        if (!root.classList.contains("ac-shield")) root.classList.add("ac-shield");
-        if (!overlay.isConnected) root.appendChild(overlay);
-        ensureStyle();
-      });
+      guard = new MutationObserver(reassert);
       guard.observe(root, { attributes: true, attributeFilter: ["class"], childList: true });
+      guard.observe(styleEl, { attributes: true, childList: true, characterData: true, subtree: true });
+      guard.observe(overlay, { attributes: true });
       if (document.head) guard.observe(document.head, { childList: true });
     } catch (e) {}
-    poisonReads();
+    guardTimer = setInterval(reassert, 500);
+    interceptReads();
     emit("shield", { detector: detector, sticky: !!state.sticky });
   }
 
@@ -268,6 +308,7 @@
     if (!state.shielded || state.sticky) return;
     log("heal:", via);
     if (guard) { guard.disconnect(); guard = null; }
+    if (guardTimer) { clearInterval(guardTimer); guardTimer = 0; }
     root.classList.remove("ac-shield");
     if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
     restoreReads();
@@ -276,21 +317,39 @@
     emit("heal", { via: via || "api" });
   }
 
+  function hard(detector, extra) {
+    report(detector, extra);
+    emit("detect", { detector: detector, action: "shield" });
+    shield(detector, true);
+  }
+
+  // Programmatic scrolls the host app announces (anticlone.expectScroll).
+  var scrollExpectedUntil = 0;
+
   try {
-    window.anticlone = {
+    var api = {
       version: VERSION,
-      state: state,
       config: CFG,
-      shield: function (d, s) { shield(d || "manual", !!s); },
-      heal: function (v) { heal(v || "api"); }
+      // Manual shields are always soft: the API can raise one, and heal()
+      // only ever clears soft shields.
+      shield: function (d) { shield(d || "manual", false); },
+      heal: function () { heal("api"); },
+      expectScroll: function (ms) { scrollExpectedUntil = Date.now() + (ms > 0 ? ms : 1000); }
     };
+    Object.defineProperty(api, "state", {
+      enumerable: true,
+      get: function () {
+        return { shielded: state.shielded, sticky: state.sticky, detector: state.detector, detections: state.detections.slice() };
+      }
+    });
+    Object.defineProperty(window, "anticlone", { value: api, writable: false, configurable: false, enumerable: false });
   } catch (e) {}
 
   if (isGoodBot) { log("good bot — detectors off"); return; }
 
   // ================================================== REDEPLOY DETECTION
-  // Deterministic: a page running on a hostname you didn't allow IS a copy
-  // (or a mirroring proxy). Works whenever the copy keeps this script.
+  // A page running on a hostname you didn't allow is a copy (or a mirroring
+  // proxy). Works whenever the copy keeps this script.
   function hostAllowed(host) {
     host = String(host || "").toLowerCase();
     for (var i = 0; i < CFG.origins.length; i++) {
@@ -301,14 +360,16 @@
     return false;
   }
   function onForeign(detector, extra) {
-    report(detector, extra);
-    emit("detect", { detector: detector, action: CFG.foreign });
     log("redeploy signal:", detector, extra || "");
     if (CFG.foreign === "redirect" && CFG.canonical && /^https:\/\//i.test(CFG.canonical)) {
+      report(detector, extra);
+      emit("detect", { detector: detector, action: "redirect" });
       try { location.replace(CFG.canonical.replace(/\/+$/, "") + location.pathname + location.search); } catch (e) {}
     } else if (CFG.foreign === "shield" || CFG.foreign === "redirect") {
-      var go = function () { shield(detector, true); };
-      if (document.body) go(); else document.addEventListener("DOMContentLoaded", go, { once: true });
+      hard(detector, extra);
+    } else {
+      report(detector, extra);
+      emit("detect", { detector: detector, action: "report" });
     }
   }
   var isDev = /^(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)$/.test(location.hostname);
@@ -330,29 +391,45 @@
   } catch (e) {}
 
   // =================================================== CAPTURE DETECTION
-  // Pre-paint gate: hide body until DOMContentLoaded so a tool that captures
-  // on first paint gets nothing. Real users don't notice.
-  root.classList.add("ac-gate");
-  var ungate = function () { root.classList.remove("ac-gate"); };
-  if (document.readyState !== "loading") ungate();
-  else document.addEventListener("DOMContentLoaded", ungate, { once: true });
+  // Pre-paint gate: hide body until DOMContentLoaded, but never longer than
+  // gateMs, so a slow deferred script can't blank the page. Off in safe mode.
+  if (!CFG.noGate && !CFG.safeMode && CFG.gateMs > 0 && document.readyState === "loading") {
+    root.classList.add("ac-gate");
+    var ungate = function () { root.classList.remove("ac-gate"); };
+    document.addEventListener("DOMContentLoaded", ungate, { once: true });
+    setTimeout(ungate, CFG.gateMs);
+  }
 
   // Human activity bookkeeping.
-  var lastInput = Date.now(), lastWheel = 0, lastPointer = 0, armed = false;
-  setTimeout(function () { armed = true; }, CFG.armDelayMs);
+  var lastInput = Date.now(), lastWheel = 0, lastPointer = 0, armed = false, armTimer = 0;
+  var arm = function () { armed = false; clearTimeout(armTimer); armTimer = setTimeout(function () { armed = true; }, CFG.armDelayMs); };
+  arm();
   var mark = function (e) { if (e.isTrusted) lastInput = Date.now(); };
   document.addEventListener("wheel", function (e) { if (e.isTrusted) lastInput = lastWheel = Date.now(); }, { passive: true, capture: true });
   document.addEventListener("pointerdown", function (e) { if (e.isTrusted) lastInput = lastPointer = Date.now(); }, { passive: true, capture: true });
   ["keydown", "touchmove", "mousemove"].forEach(function (t) { document.addEventListener(t, mark, { passive: true, capture: true }); });
   var quietFor = function (ms) { return Date.now() - lastInput > ms; };
 
-  // A real interaction after a SOFT trigger means we guessed wrong: heal.
+  // A real interaction after a SOFT shield means we guessed wrong: heal.
   ["pointerdown", "keydown", "wheel", "touchstart"].forEach(function (t) {
     document.addEventListener(t, function (e) { if (e.isTrusted) heal("input"); }, { passive: true, capture: true });
   });
 
-  var hard = function (name) { shield(name, true); };
-  var soft = function (name) { if (!CFG.safeMode && armed) shield(name, false); };
+  // Soft signals are suspicions. Each is reported once; the page is only
+  // shielded when two DISTINCT signals agree within corroborateMs (or when a
+  // signal is already self-corroborating, like the 2-of-3 headless check).
+  var suspects = {};
+  function soft(name, selfCorroborated) {
+    if (!armed) return;
+    var now = Date.now();
+    suspects[name] = now;
+    report(name);
+    var agreeing = [];
+    for (var k in suspects) if (now - suspects[k] < CFG.corroborateMs) agreeing.push(k);
+    var act = !CFG.safeMode && (selfCorroborated || agreeing.length >= 2);
+    emit("detect", { detector: name, action: act ? "shield" : "suspect" });
+    if (act) shield(selfCorroborated ? name : agreeing.sort().join("+"), false);
+  }
 
   // --- HARD: automation flags
   if (!CFG.allowAutomation) {
@@ -366,35 +443,50 @@
     "__figma_h2d_chrome_extension_toolbar__",
     "__figma_capture_cursor_style__",
     "__h2d_anim_pause"
-  ].concat(CFG.fingerprints);
+  ].concat(CFG.fingerprints.filter(function (id) { return /^[\w-]+$/.test(id); }));
   var FP_TAGS = ["figma-html-to-design-toolbar"];
-  var isCaptureNode = function (n) {
-    return !!n && n.nodeType === 1 && (FP_IDS.indexOf(n.id) >= 0 || FP_TAGS.indexOf(n.localName) >= 0);
+  var FP_SEL = FP_IDS.map(function (id) { return '[id="' + id + '"]'; }).concat(FP_TAGS).join(",");
+  // Matches the node itself or anything inside it (a wrapper holding the toolbar).
+  var isCaptureTree = function (n) {
+    try { return !!n && n.nodeType === 1 && (n.matches(FP_SEL) || (!!n.firstElementChild && !!n.querySelector(FP_SEL))); }
+    catch (e) { return false; }
   };
   var scanFingerprints = function () {
-    for (var i = 0; i < FP_IDS.length; i++) if (document.getElementById(FP_IDS[i])) return true;
-    for (var j = 0; j < FP_TAGS.length; j++) if (document.getElementsByTagName(FP_TAGS[j]).length) return true;
-    return false;
+    try { return !!document.querySelector(FP_SEL); } catch (e) { return false; }
   };
   try {
     new MutationObserver(function (muts) {
-      for (var i = 0; i < muts.length; i++)
-        for (var j = 0; j < muts[i].addedNodes.length; j++)
-          if (isCaptureNode(muts[i].addedNodes[j])) return hard("capture-tool");
-    }).observe(root, { childList: true, subtree: true });
+      for (var i = 0; i < muts.length; i++) {
+        var m = muts[i];
+        if (m.type === "attributes") { if (isCaptureTree(m.target)) return hard("capture-tool"); continue; }
+        for (var j = 0; j < m.addedNodes.length; j++)
+          if (isCaptureTree(m.addedNodes[j])) return hard("capture-tool");
+      }
+    }).observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ["id"] });
   } catch (e) {}
-  document.addEventListener("DOMContentLoaded", function () { if (scanFingerprints()) hard("capture-tool"); }, { once: true });
-  // Global written by the html.to.design serializer — trap the assignment.
+  // Scan now (covers late initialization) and again once parsing is done.
+  if (scanFingerprints()) hard("capture-tool");
+  if (document.readyState === "loading")
+    document.addEventListener("DOMContentLoaded", function () { if (scanFingerprints()) hard("capture-tool"); }, { once: true });
+
+  // Global written by the html.to.design serializer. If it already exists the
+  // serializer ran before us: detect, and leave its value untouched.
   try {
-    var h2dVal;
-    Object.defineProperty(window, "__h2d_serializeIframe", {
-      configurable: false, enumerable: false,
-      get: function () { return h2dVal; },
-      set: function (v) { h2dVal = v; hard("capture-tool"); }
-    });
+    var h2dKey = "__h2d_serializeIframe";
+    var existing = Object.getOwnPropertyDescriptor(window, h2dKey);
+    if (existing) {
+      if (existing.get || existing.value !== undefined) hard("capture-tool");
+    } else {
+      var h2dVal;
+      Object.defineProperty(window, h2dKey, {
+        configurable: false, enumerable: false,
+        get: function () { return h2dVal; },
+        set: function (v) { h2dVal = v; hard("capture-tool"); }
+      });
+    }
   } catch (e) {}
 
-  // --- SOFT: headless environment (needs 2 of 3 signals)
+  // --- SOFT: headless environment (self-corroborating: needs 2 of 3 signals)
   if (!CFG.allowAutomation) {
     (function () {
       var score = 0;
@@ -405,11 +497,14 @@
         if (ext && /swiftshader|llvmpipe/i.test(String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)))) score++;
       } catch (e) {}
       if (!navigator.languages || navigator.languages.length === 0) score++;
-      if (score >= 2) setTimeout(function () { soft("headless-env"); }, CFG.armDelayMs + 10);
+      if (score >= 2) setTimeout(function () { soft("headless-env", true); }, CFG.armDelayMs + 10);
     })();
   }
 
-  // --- SOFT: scripted scroll jumps with no human input behind them
+  // --- SOFT: scripted scroll jumps with no human input behind them.
+  // Browser scroll restoration (history navigation, hash links) is excused.
+  window.addEventListener("popstate", function () { scrollExpectedUntil = Date.now() + 1500; });
+  window.addEventListener("hashchange", function () { scrollExpectedUntil = Date.now() + 1500; });
   (function () {
     var lastY = window.scrollY, lastT = Date.now();
     window.addEventListener("scroll", function () {
@@ -417,6 +512,7 @@
       // otherwise look slow (15000px over 3000ms).
       var now = Date.now(), dy = Math.abs(window.scrollY - lastY), dt = Math.min(now - lastT, 100) || 1;
       lastY = window.scrollY; lastT = now;
+      if (now < scrollExpectedUntil) return;
       if (dy > CFG.scrollMinJump && dy / dt > CFG.scrollVelocity &&
           quietFor(CFG.scrollQuietMs) && now - lastWheel > CFG.scrollQuietMs && now - lastPointer > 3000)
         soft("scroll-velocity");
@@ -460,11 +556,16 @@
     })();
   })();
 
-  // Back/forward cache restore starts clean.
+  // Back/forward cache restore: only SOFT state resets. Sticky shields stay,
+  // because their causes (host, automation, a capture tool that was present)
+  // don't change by going back in history. Then re-check fingerprints.
   window.addEventListener("pageshow", function (e) {
     if (!e.persisted) return;
-    state.sticky = false;
-    heal("bfcache");
+    suspects = {};
+    lastInput = Date.now();
+    scrollExpectedUntil = Date.now() + 1500;
+    arm();
+    if (state.shielded && !state.sticky) heal("bfcache");
     if (scanFingerprints()) hard("capture-tool");
   });
 
