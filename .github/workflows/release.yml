@@ -1,0 +1,46 @@
+# Bump VERSION in anticlone.js (and the header + README pin), push to main,
+# and this tags vX.Y.Z and publishes the GitHub release automatically.
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths: [anticlone.js, README.md]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check syntax
+        run: node --check anticlone.js
+
+      - name: Read and verify version
+        id: v
+        run: |
+          VERSION=$(grep -oE 'var VERSION = "[0-9]+\.[0-9]+\.[0-9]+"' anticlone.js | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          test -n "$VERSION" || { echo "::error::VERSION not found in anticlone.js"; exit 1; }
+          grep -q "anticlone.js v$VERSION" anticlone.js || { echo "::error::Header comment is not v$VERSION"; exit 1; }
+          grep -q "anticlone@v$VERSION/" README.md || { echo "::error::README install snippet is not pinned to v$VERSION"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "v$VERSION already released, nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tag and release
+        if: steps.v.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.v.outputs.version }}" anticlone.js \
+            --target "$GITHUB_SHA" \
+            --title "v${{ steps.v.outputs.version }}" \
+            --generate-notes
